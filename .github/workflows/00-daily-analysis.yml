@@ -1,3 +1,4 @@
+# 添加注释，激活schedule
 name: 每日股票分析
 
 on:
