@@ -17,7 +17,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.memory import AgentMemory
-from src.agent.protocols import AgentContext, AgentOpinion, StageResult, StageStatus
+from src.agent.protocols import (
+    AgentContext,
+    AgentOpinion,
+    StageFailureReason,
+    StageResult,
+    StageStatus,
+)
 from src.agent.runner import RunLoopResult, run_agent_loop
 from src.agent.skills.defaults import extract_skill_id
 from src.agent.tools.registry import ToolRegistry
@@ -127,13 +133,19 @@ class BaseAgent(ABC):
 
             result.tokens_used = loop_result.total_tokens
             result.tool_calls_count = len(loop_result.tool_calls_log)
+            # Keep compatibility with lightweight test doubles and legacy
+            # adapters that predate RunLoopResult.total_steps.
+            result.total_steps = getattr(loop_result, "total_steps", 0)
             result.meta["raw_text"] = loop_result.content
             result.meta["models_used"] = loop_result.models_used
             result.meta["tool_calls_log"] = loop_result.tool_calls_log
+            failure_reason = getattr(loop_result, "failure_reason", None)
+            result.failure_reason = failure_reason
 
             if not loop_result.success:
                 result.status = StageStatus.FAILED
                 result.error = loop_result.error or "Agent loop did not produce a final answer"
+                result.failure_reason = failure_reason or StageFailureReason.STAGE_FAILURE
                 return result
 
             # Post-process into structured opinion
@@ -146,10 +158,16 @@ class BaseAgent(ABC):
 
             result.status = StageStatus.COMPLETED
 
+        except TimeoutError as exc:
+            logger.error("[%s] execution timed out: %s", self.agent_name, exc, exc_info=True)
+            result.status = StageStatus.FAILED
+            result.error = str(exc)
+            result.failure_reason = StageFailureReason.TIMEOUT
         except Exception as exc:
             logger.error("[%s] execution failed: %s", self.agent_name, exc, exc_info=True)
             result.status = StageStatus.FAILED
             result.error = str(exc)
+            result.failure_reason = StageFailureReason.STAGE_FAILURE
         finally:
             result.duration_s = round(time.time() - t0, 2)
 
@@ -242,7 +260,9 @@ class BaseAgent(ABC):
             return self.tool_registry
 
         from src.agent.tools.registry import ToolRegistry as TR
-        filtered = TR()
+        # Carry the source registry's category-timeout map so the filtered subset
+        # still enforces the per-category ceilings (review OR-COM-7f3d3f5b).
+        filtered = TR(category_timeout_map=self.tool_registry.category_timeout_map)
         for name in self.tool_names:
             tool_def = self.tool_registry.get(name)
             if tool_def:
@@ -257,27 +277,39 @@ class BaseAgent(ABC):
             return ""
 
         entries = self.memory.get_stock_history(ctx.stock_code, limit=3)
-        if not entries:
+        review = self.memory.get_decision_signal_review(ctx.stock_code)
+        if not entries and review is None:
             return ""
 
-        lines = ["[Memory: recent analysis history]"]
-        for entry in entries:
-            parts = [
-                entry.date or "unknown_date",
-                f"signal={entry.signal or 'unknown'}",
-                f"sentiment={entry.sentiment_score}",
+        sections: List[str] = []
+        if entries:
+            lines = ["[Memory: recent analysis history]"]
+            for entry in entries:
+                parts = [
+                    entry.date or "unknown_date",
+                    f"signal={entry.signal or 'unknown'}",
+                    f"sentiment={entry.sentiment_score}",
+                ]
+                if entry.price_at_analysis:
+                    parts.append(f"price={entry.price_at_analysis}")
+                if entry.outcome_5d is not None:
+                    parts.append(f"outcome_5d={entry.outcome_5d}")
+                if entry.outcome_20d is not None:
+                    parts.append(f"outcome_20d={entry.outcome_20d}")
+                if entry.was_correct is not None:
+                    parts.append(f"was_correct={entry.was_correct}")
+                lines.append("- " + ", ".join(parts))
+            lines.append("Use this memory as context only; do not copy it verbatim into the final answer.")
+            sections.append("\n".join(lines))
+        if review is not None:
+            review_lines = [
+                "[Memory: decision-signal review]",
+                "- " + review.to_prompt_line(),
+                "This review is observation-only context; do not treat historical "
+                "hit rate as a buy/sell strength signal.",
             ]
-            if entry.price_at_analysis:
-                parts.append(f"price={entry.price_at_analysis}")
-            if entry.outcome_5d is not None:
-                parts.append(f"outcome_5d={entry.outcome_5d}")
-            if entry.outcome_20d is not None:
-                parts.append(f"outcome_20d={entry.outcome_20d}")
-            if entry.was_correct is not None:
-                parts.append(f"was_correct={entry.was_correct}")
-            lines.append("- " + ", ".join(parts))
-        lines.append("Use this memory as context only; do not copy it verbatim into the final answer.")
-        return "\n".join(lines)
+            sections.append("\n".join(review_lines))
+        return "\n\n".join(sections)
 
     def _apply_memory_calibration(self, ctx: AgentContext, opinion: AgentOpinion, result: StageResult) -> None:
         """Adjust confidence using historical calibration when enabled."""
